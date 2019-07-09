@@ -4,7 +4,7 @@
 # also able to rename functions based on the guessed function name & rename
 # functions based on the source code file they belong to.
 #
-# Copyright (c) 2018, Joxean Koret
+# Copyright (c) 2018-2019, Joxean Koret
 # Licensed under the GNU GPL v3.
 #
 #-------------------------------------------------------------------------------
@@ -38,7 +38,7 @@ except NameError:
   long = int  # Python 3
 
 #-------------------------------------------------------------------------------
-PROGRAM_NAME = "IDAMagicStrings"
+PROGRAM_NAME = "IMS"
 
 #-------------------------------------------------------------------------------
 SOURCE_FILES_REGEXP = r"([a-z_\/\\][a-z0-9_/\\:\-\.@]+\.(c|cc|cxx|c\+\+|cpp|h|hpp|m|rs|go|ml))($|:| )"
@@ -54,6 +54,7 @@ LANGS["OCaml"] = ["ml"]
 
 #-------------------------------------------------------------------------------
 FUNCTION_NAMES_REGEXP = r"([a-z_][a-z0-9_]+((::)+[a-z_][a-z0-9_]+)*)"
+CLASS_NAMES_REGEXP    = r"([a-z_][a-z0-9_]+(::(<[a-z0-9_]+>|~{0,1}[a-z0-9_]+))+)\({0,1}"
 NOT_FUNCTION_NAMES = ["copyright", "char", "bool", "int", "unsigned", "long",
   "double", "float", "signed", "license", "version", "cannot", "error",
   "invalid", "null", "warning", "general", "argument", "written", "report",
@@ -368,6 +369,8 @@ class CCandidateFunctionNames(Choose2):
     self.selected_items = sel_list
 
   def looks_false(self, bin_func, candidate):
+    bin_func  = bin_func.lower()
+    candidate = candidate.lower()
     if not bin_func.startswith("sub_"):
       if bin_func.find(candidate) == -1 and candidate.find(bin_func) == -1:
         return True
@@ -382,6 +385,226 @@ class CCandidateFunctionNames(Choose2):
     return [0xFFFFFF, 0]
 
 #-------------------------------------------------------------------------------
+class CClassXRefsChooser(idaapi.Choose2):
+  def __init__(self, title, items):
+    idaapi.Choose2.__init__(self,
+                     title,
+                     [ ["Address", 8], ["String", 80] ])
+    self.items = items
+
+  def OnGetLine(self, n):
+    return self.items[n]
+
+  def OnGetSize(self):
+    return len(self.items)
+
+#-------------------------------------------------------------------------------
+def get_string(ea):
+  tmp = GetString(ea)
+  if tmp is None or len(tmp) == 1:
+    unicode_tmp = GetString(ea, strtype=1)
+    if unicode_tmp is not None and len(unicode_tmp) > len(tmp):
+      tmp = unicode_tmp
+  
+  if tmp is None:
+    tmp = ""
+  return tmp
+
+#-------------------------------------------------------------------------------
+def classes_handler(item, column_no):
+  if item.childCount() == 0:
+    ea = item.ea
+    if isEnabled(ea):
+      jumpto(ea)
+
+#-------------------------------------------------------------------------------
+class CClassesTreeViewer(PluginForm):
+  def populate_tree(self):
+    # Clear previous items
+    self.tree.clear()
+    self.nodes = {}
+
+    self.classes = sorted(self.classes, key=lambda x: x[1][0])
+    for ea, tokens in self.classes:
+      for i, node_name in enumerate(tokens):
+        full_name = "::".join(tokens[:tokens.index(node_name)+1])
+        if full_name not in self.nodes:
+          if full_name.find("::") == -1:
+            parent = self.tree
+          else:
+            parent_name = "::".join(tokens[:tokens.index(node_name)])
+            parent = self.nodes[parent_name]
+
+          node = QtWidgets.QTreeWidgetItem(parent)
+          node.setText(0, full_name)
+          node.ea = ea
+          self.nodes[full_name] = node
+
+    self.tree.itemDoubleClicked.connect(classes_handler)
+
+  def OnCreate(self, form):
+    # Get parent widget
+    self.parent = idaapi.PluginForm.FormToPyQtWidget(form)
+
+    # Create tree control
+    self.tree = QtWidgets.QTreeWidget()
+    self.tree.setHeaderLabels(("Classes",))
+    self.tree.setColumnWidth(0, 100)
+
+    # Create layout
+    layout = QtWidgets.QVBoxLayout()
+    layout.addWidget(self.tree)
+    self.populate_tree()
+
+    # Populate PluginForm
+    self.parent.setLayout(layout)
+
+  def Show(self, title, classes):
+    self.classes = classes
+    return PluginForm.Show(self, title, options = PluginForm.FORM_PERSIST)
+
+#-------------------------------------------------------------------------------
+class CClassesGraph(idaapi.GraphViewer):
+  def __init__(self, title, classes, final_list):
+    idaapi.GraphViewer.__init__(self, title)
+    self.classes = classes
+    self.final_list = final_list
+    self.nodes = {}
+    self.nodes_ea = {}
+    self.graph = {}
+
+    dones = set()
+    for ea, tokens in self.classes:
+      refs = DataRefsTo(ea)
+      refs_funcs = set()
+      for ref in refs:
+        func = idaapi.get_func(ref)
+        if func is not None:
+          refs_funcs.add(func.startEA)
+
+      if len(refs_funcs) == 1:
+        func_ea = list(refs_funcs)[0]
+        if func_ea in dones:
+          continue
+        dones.add(func_ea)
+
+        func_name = GetFunctionName(func_ea)
+        tmp = Demangle(func_name, INF_SHORT_DN)
+        if tmp is not None:
+          func_name = tmp
+
+        element = [func_ea, func_name, "::".join(tokens), [get_string(ea)]]
+        self.final_list.append(element)
+
+  def OnRefresh(self):
+    self.Clear()
+    self.graph = {}
+    for ea, tokens in self.classes:
+      for node_name in tokens:
+        full_name = "::".join(tokens[:tokens.index(node_name)+1])
+        if full_name not in self.nodes:
+          node_id = self.AddNode(node_name)
+          self.nodes[full_name] = node_id
+          self.graph[node_id] = []
+        else:
+          node_id = self.nodes[full_name]
+
+        try:
+          self.nodes_ea[node_id].add(ea)
+        except KeyError:
+          self.nodes_ea[node_id] = set([ea])
+
+        parent_name = "::".join(tokens[:tokens.index(node_name)])
+        if parent_name != "" and parent_name in self.nodes:
+          parent_id = self.nodes[parent_name]
+          self.AddEdge(parent_id, node_id)
+          self.graph[parent_id].append(node_id)
+
+    return True
+
+  def OnGetText(self, node_id):
+    return str(self[node_id])
+
+  def OnDblClick(self, node_id):
+    eas = self.nodes_ea[node_id]
+    if len(eas) == 1:
+      jumpto(list(eas)[0])
+    else:
+      items = []
+      for ea in eas:
+        func = idaapi.get_func(ea)
+        if func is None:
+          s = GetString(ea)
+          if s is not None and s.find(str(self[node_id])) == -1:
+            s = GetString(ea, strtype=1)
+          else:
+            s = GetDisasm(ea)
+        else:
+          s = GetFunctionName(func.startEA)
+
+        items.append(["0x%08x" % ea, repr(s)])
+
+      chooser = CClassXRefsChooser("XRefs to %s" % str(self[node_id]), items)
+      idx = chooser.Show(1)
+      if idx > -1:
+        jumpto(list(eas)[idx])
+
+  def OnCommand(self, cmd_id):
+    if self.cmd_dot == cmd_id:
+      fname = idc.AskFile(1, "*.dot", "Dot file name")
+      if fname:
+        f = open(fname, "wb")
+        buf = 'digraph G {\n graph [overlap=scale]; node [fontname=Courier]; \n\n'
+        for n in self.graph:
+          name = str(self[n])
+          buf += ' a%s [shape=box, label = "%s", color="blue"]\n' % (n, name)
+        buf += '\n'
+
+        dones = set()
+        for node_id in self.graph:
+          for child_id in self.graph[node_id]:
+            s = str([node_id, child_id])
+            if s in dones:
+              continue
+            dones.add(s)
+            buf += " a%s -> a%s [style = bold]\n" % (node_id, child_id)
+
+        buf += '\n'
+        buf += '}'
+        f.write(buf)
+        f.close()
+    elif self.cmd_gml == cmd_id:
+      fname = idc.AskFile(1, "*.gml", "GML file name")
+      if fname:
+        f = open(fname, "wb")
+        buf = 'graph [ \n'
+        for n in self.graph:
+          name = str(self[n])
+          buf += 'node [ id %s \n label "%s"\n fill "blue" \n type "oval"\n LabelGraphics [ type "text" ] ] \n' % (n, name)
+        buf += '\n'
+
+        dones = set()
+        for node_id in self.graph:
+          for child_id in self.graph[node_id]:
+            s = str([node_id, child_id])
+            if s in dones:
+              continue
+            dones.add(s)
+            buf += " edge [ source %s \n target %s ]\n" % (node_id, child_id)
+
+        buf += '\n'
+        buf += ']'
+        f.write(buf)
+        f.close()
+
+  def Show(self):
+    if not idaapi.GraphViewer.Show(self):
+      return False
+    self.cmd_dot = self.AddCommand("Export to Graphviz", "F2")
+    self.cmd_gml = self.AddCommand("Export to GML", "F3")
+    return True
+
+#-------------------------------------------------------------------------------
 def show_tree(d = None):
   tree_frm = CBaseTreeViewer()
   tree_frm.Show(PROGRAM_NAME + ": Source code tree", d)
@@ -394,11 +617,53 @@ def seems_function_name(candidate):
   return False
 
 #-------------------------------------------------------------------------------
-def show_function_names(strings_list):
+class CFakeString:
+  def __init__(self, ea, s):
+    self.ea = ea
+    self.s = s
+
+  def __str__(self):
+    return str(self.s)
+
+  def __repr__(self):
+    return self.__str__()
+  
+#-------------------------------------------------------------------------------
+def find_function_names(strings_list):
   rarity = {}
   func_names = {}
   raw_func_strings = {}
-  for s in strings_list:
+  class_objects = []
+
+  class_tmp_names = []
+  for ea, name in Names():
+    func = idaapi.get_func(ea)
+    if func is None:
+      continue
+
+    true_name = name
+    if name.find("::") == -1:
+      name = Demangle(name, INF_SHORT_DN)
+      if name is not None and name != "" and name.find("::") > -1:
+        true_name = name
+
+    if true_name.find("::") > -1:
+      s = CFakeString(ea, true_name)
+      class_tmp_names.append(s)
+
+  class_tmp_names.extend(strings_list)
+  for s in class_tmp_names:
+    # Find class members
+    class_ret = re.findall(CLASS_NAMES_REGEXP, str(s), re.IGNORECASE)
+    if len(class_ret) > 0:
+      for element in class_ret:
+        candidate = element[0]
+        if candidate.find("::") > 0:
+          tokens = candidate.split("::")
+          if tokens not in class_objects:
+            class_objects.append([s.ea, tokens])
+
+    # Find just function names
     ret = re.findall(FUNCTION_NAMES_REGEXP, str(s), re.IGNORECASE)
     if len(ret) > 0:
       candidate = ret[0][0]
@@ -440,6 +705,13 @@ def show_function_names(strings_list):
             except:
               raw_func_strings[key] = set([str(s)])
 
+  return func_names, raw_func_strings, rarity, class_objects
+
+#-------------------------------------------------------------------------------
+def show_function_names(strings_list):
+  l = find_function_names(strings_list)
+  func_names, raw_func_strings, rarity, classes = l
+
   final_list = []
   for key in func_names:
     candidates = set()
@@ -457,15 +729,29 @@ def show_function_names(strings_list):
         func_name = tmp
       final_list.append([key, func_name, list(candidates)[0], raw_strings])
 
-  cfn = CCandidateFunctionNames(PROGRAM_NAME + ": Candidate Function Names", final_list)
-  cfn.show()
+  if len(classes) > 0:
+    class_graph = CClassesGraph(PROGRAM_NAME + ": Classes Hierarchy", classes, final_list)
+    class_graph.Show()
+    
+    class_tree = CClassesTreeViewer()
+    class_tree.Show(PROGRAM_NAME + ": Classes Tree", classes)
+
+    final_list = class_graph.final_list
+
+  if len(final_list) > 0:
+    cfn = CCandidateFunctionNames(PROGRAM_NAME + ": Candidate Function Names", final_list)
+    cfn.show()
 
 #-------------------------------------------------------------------------------
 def main():
   ch = CSourceFilesChooser(PROGRAM_NAME + ": Source code files")
-  ch.show()
+  if len(ch.items) > 0:
+    ch.show()
+
   d = ch.d
-  show_tree(d)
+  if len(d) > 0:
+    show_tree(d)
+
   show_function_names(ch.s)
 
 if __name__ == "__main__":
